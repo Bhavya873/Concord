@@ -1,0 +1,24 @@
+[package]
+name = "concord-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
+concord-raft = { path = "../raft" }
+concord-kv = { path = "../kv" }
+concord-storage = { path = "../storage" }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
