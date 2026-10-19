@@ -1,13 +1,13 @@
 //! Per-visitor sessions for the public web demo.
 //!
-//! Each visitor gets their own pair of clusters (Concord and the baseline) so strangers never
-//! see or disturb each other. Sessions advance lazily: a request runs the ticks that are due
+//! Each visitor gets their own intersection (Concord's Raft cluster and the baseline
+//! controllers) so strangers never see or disturb each other. Sessions advance lazily: a request runs the ticks that are due
 //! since the last one, capped, so an idle tab costs nothing and there is no global ticker.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::{AckPolicy, Cluster};
+use crate::intersection::Intersection;
 
 /// Live sessions kept at most. The least recently seen one is dropped to make room.
 pub const MAX_SESSIONS: usize = 200;
@@ -19,11 +19,9 @@ pub const MAX_CATCH_UP_TICKS: u64 = 40;
 /// Simulated tick length. One fixed speed, slow enough to follow messages by eye.
 pub const TICK_MS: u64 = 220;
 
-/// Both clusters for one visitor. They share a seed and receive the same faults, so the only
-/// difference between them is when the client is told "confirmed".
+/// One visitor's intersection and the wall clock it runs on.
 pub struct Session {
-    pub concord: Cluster,
-    pub baseline: Cluster,
+    pub intersection: Intersection,
     last_seen: Instant,
     /// Wall-clock time up to which ticks have been run.
     clock: Instant,
@@ -32,17 +30,14 @@ pub struct Session {
 impl Session {
     pub fn new(seed: u64, now: Instant) -> Self {
         Self {
-            concord: Cluster::with_policy(seed, AckPolicy::Majority),
-            baseline: Cluster::with_policy(seed, AckPolicy::LeaderOnly),
+            intersection: Intersection::new(seed),
             last_seen: now,
             clock: now,
         }
     }
 
-    /// Advance both clusters by one tick, in lockstep.
     pub fn step(&mut self) {
-        self.concord.step();
-        self.baseline.step();
+        self.intersection.step();
     }
 
     /// Run the ticks that are due by `now`. Returns how many ran.
@@ -59,14 +54,6 @@ impl Session {
             self.clock += Duration::from_millis(run * TICK_MS);
         }
         run
-    }
-
-    pub fn to_json(&self) -> String {
-        format!(
-            "{{\"tick_ms\":{TICK_MS},\"concord\":{},\"baseline\":{}}}",
-            self.concord.to_json(),
-            self.baseline.to_json()
-        )
     }
 }
 
@@ -136,7 +123,6 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TicketState;
 
     fn ids() -> impl FnMut() -> String {
         let mut n = 0;
@@ -161,29 +147,28 @@ mod tests {
     }
 
     #[test]
-    fn visitors_do_not_share_clusters() {
+    fn visitors_do_not_share_intersections() {
         let mut s = Sessions::new(10, IDLE_TTL);
         let mut next = ids();
         let mut now = Instant::now();
         let (a, _, _) = s.touch(None, &mut next, now);
         let (b, _, _) = s.touch(None, &mut next, now);
-        // Let both elect a leader.
         for _ in 0..60 {
             now += Duration::from_millis(TICK_MS);
             s.touch(Some(&a), &mut next, now).2.catch_up(now);
             s.touch(Some(&b), &mut next, now).2.catch_up(now);
         }
+        s.touch(Some(&a), &mut next, now)
+            .2
+            .intersection
+            .toggle_cable(1);
         let (_, _, sa) = s.touch(Some(&a), &mut next, now);
-        let ticket = sa.concord.put(b"order-1", b"headphones").unwrap();
-        for _ in 0..30 {
-            sa.step();
-        }
-        assert_eq!(sa.concord.ticket_state(&ticket), TicketState::Acked);
+        assert!(sa.intersection.concord.is_isolated(1));
         let (_, _, sb) = s.touch(Some(&b), &mut next, now);
-        for id in [1, 2, 3] {
-            assert_eq!(sb.concord.get(id, b"order-1"), None);
-        }
-        assert!(sb.concord.tickets().is_empty());
+        assert!(
+            !sb.intersection.concord.is_isolated(1),
+            "b saw a's cable cut"
+        );
     }
 
     #[test]
@@ -221,8 +206,7 @@ mod tests {
         let mut s = Session::new(1, t0);
         let ran = s.catch_up(t0 + Duration::from_millis(TICK_MS * 5 + 10));
         assert_eq!(ran, 5);
-        assert_eq!(s.concord.tick_count(), 5);
-        assert_eq!(s.baseline.tick_count(), 5);
+        assert_eq!(s.intersection.tick(), 5);
         let ran = s.catch_up(t0 + Duration::from_secs(600));
         assert_eq!(ran, MAX_CATCH_UP_TICKS);
         // After a capped gap the clock resumes from "now", not from the backlog.

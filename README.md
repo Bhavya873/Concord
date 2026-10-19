@@ -1,47 +1,45 @@
-# Concord 🗄️
+# Concord 🚦
 
 Concord is a small replicated database I built in Rust to learn how systems like etcd keep data safe. It saves every write on three servers and uses the Raft consensus algorithm, so a write it confirms is still there after one server crashes or gets cut off from the network.
 
-The demo compares two ways of telling a customer "your order is confirmed":
+The demo puts Concord inside a traffic intersection. Three controllers share one light schedule, and you can cut their cables or turn them off to see what happens with Raft and without it.
 
-- **Async replication** — confirm as soon as the main server has the order, then copy it to the others afterwards.
-- **Concord** — confirm only after 2 of the 3 servers have saved it.
+Concord is a portfolio project, not a production database or a real traffic controller.
 
-Concord is a portfolio project, not a production database.
+## The problem 🚥
 
-## The problem 🛒
+Picture an intersection run by three controllers, so that one failure can't stop it. C1 drives the North–South lights, C2 drives the East–West lights and C3 is a backup. They have to agree on whose turn it is.
 
-Say an online store keeps its orders in three data centers. A customer checks out, the main data center saves the order and says "confirmed". If that data center loses power before it copies the order anywhere else, the order is gone. The customer has a confirmation for an order the store no longer has.
+If they can't agree, redundancy makes things worse. Cut C1's cable and it can't tell whether the others are gone, so it keeps North–South green on its own while C2 keeps cycling East–West. Both roads get green and cars collide.
 
-Concord waits until a second data center has the order on disk before it says "confirmed". Losing any one data center can't erase an order that was confirmed.
+With Concord, a green only counts once 2 of the 3 controllers have it. A controller that's cut off can't reach 2 of 3, so it can't start a green on its own. When one of the light controllers is lost, the other two still make a majority, and they agree to switch the whole intersection to flashing red, an all-way stop, until it's back.
 
 ## How it works 🧭
 
 ```text
-Customer places an order
+Leader plans "North–South green from tick 120 to 138"
         |
         v
-Main server writes it to its log and syncs to disk
+Writes it to its log, syncs to disk, sends it to the other two
         |
-        v
-Sends it to the other two servers
+        +-- only 1 of 3 has it --> no light shows it yet
         |
-        +-- only 1 of 3 has it --> keep waiting (async replication already said "confirmed")
-        |
-        +-- 2 of 3 have it -----> committed --> tell the customer "confirmed"
+        +-- 2 of 3 have it -----> committed --> the lights may show it
 ```
 
 Raft has three main parts:
 
-1. **Leader election.** The servers vote for one main server (the leader). Winning takes 2 of 3 votes. Every election has a term number, so an old leader that comes back is ignored.
-2. **Log replication.** The leader sends every write to the others in order. A follower only accepts an entry if its log matches the leader's up to that point, so the copies can't drift apart.
-3. **Commit rule.** A write counts as saved once a majority has it. Any two majorities out of 3 share at least one server, so the next leader always has every committed write.
+1. **Leader election.** The controllers vote for one leader. Winning takes 2 of 3 votes. Every election has a term number, so an old leader that comes back is ignored.
+2. **Log replication.** The leader sends every entry to the others in order. A follower only accepts an entry if its log matches the leader's up to that point, so the copies can't drift apart.
+3. **Commit rule.** An entry counts once a majority has it. Any two majorities out of 3 share at least one controller, so the next leader always has every committed entry.
 
-The rule I had to be most careful with: a server syncs its log to disk *before* it votes or replies. If it replied first and then crashed, it could forget something it already agreed to.
+The rule I had to be most careful with: a node syncs its log to disk *before* it votes or replies. If it replied first and then crashed, it could forget something it already agreed to.
+
+The intersection adds one rule on top. Each green has a start and end on a shared clock, and the leader only plans a new green after every green already in its log has ended. The next leader's log holds every committed green, so two committed greens can never overlap.
 
 ## Why it helps ⚡
 
-I ran the same random crash and network-split schedules against both approaches in the simulator (1,000 schedules, 1,500 ticks each):
+I ran the same random crash and network-split schedules against Concord and against async replication, which confirms a write as soon as the leader has it (1,000 schedules, 1,500 ticks each):
 
 | Approach | Confirmed writes lost | Schedules with a loss |
 | --- | ---: | ---: |
@@ -50,26 +48,34 @@ I ran the same random crash and network-split schedules against both approaches 
 
 Concord confirmed 183,268 writes across those runs and lost none of them. These numbers come from simulated time on my laptop (Apple M1 Pro), not real servers.
 
-Concord isn't free, though. Every write waits for a second server, which adds a network round trip. If 2 of the 3 servers are down, Concord stops taking writes instead of risking them. Async replication is still a good choice for things like caches or metrics, where losing the last few writes is okay. I haven't measured latency, throughput or failover time yet.
+For the intersection, a test runs 40 random schedules of cable cuts and power-offs (1,500 ticks each) and checks that Concord never shows both roads green. The version without Raft does.
+
+Concord isn't free, though. When it can't be sure, it flashes red, so drivers wait longer. If 2 of the 3 controllers are down, it can't agree on anything new and stays on flashing red. I haven't measured latency, throughput or failover time.
 
 ## The demo 🖥️
 
-The demo is a 3D model of three data centers (Ashburn, Frankfurt and Singapore). Both approaches run on the same data centers and get hit by the same failures:
+Two intersections sit side by side with the same hardware and the same traffic:
 
-- **Power cut**: the main data center saves an order and loses power before it copies it.
-- **Cable cut**: the main data center gets cut off, takes an order on its own, and the other two carry on without it.
+- **Baseline**: three controllers without Raft. Each one trusts only what it hears.
+- **Concord**: three controllers with Raft. A green needs 2 of 3 to agree.
 
-You press **Next** to go through each step. The **What happened** log at the bottom shows both stores side by side, so you can see Async replication confirm an order that Concord is still waiting on. The counter at the top shows how many confirmed orders each one lost. There's also a **Try it yourself** panel where you can place orders, turn data centers off and cut cables.
+Tap a controller to **cut its cable** or **turn it off**. The same failure hits both intersections. Things to try:
 
-The page runs Concord's real Raft code inside a simulator on the server, and every visitor gets their own private copy. A "power cut" is a simulated crash: whatever a server synced to disk survives, and everything else is lost.
+- Cut C1's cable. Baseline puts both roads on green and cars crash. Concord flashes red and nobody crashes.
+- Turn off C2, the leader. Concord's other two controllers elect a new leader and fail safe.
+- Turn off C3, the backup. Concord keeps cycling normally.
+
+Each side counts **collisions**, **cars through** and **average wait**. Keyboard: `1`/`2`/`3` cut or reconnect a controller, `Shift` + number turns it off or on, `Space` pauses.
+
+The lights and controllers come from the simulator on the server, and every visitor gets their own private copy. Concord's controllers are a real Raft cluster running this repo's code. The browser only draws the cars and counts what happens. Drivers treat a dark or flashing signal like a stop sign and yield to cross traffic, so a crash means two roads really had green at once.
+
+Real intersections also have a hardware conflict monitor that forces flashing red if two roads ever get green. The demo leaves it out to show what the controllers' agreement does on its own. The simulator's tick stands in for the GPS-synced clock real controllers share.
 
 ## Built with 🛠️
 
-- **Rust** for Raft, the write-ahead log, the key-value store and the simulator
+- **Rust** for Raft, the write-ahead log, the key-value store, the simulator and the intersection
 - **tonic (gRPC)** for running a real three-node cluster
-- **three.js** for the 3D data centers
-- Plain HTML, CSS and JavaScript for the demo page, served by a small Rust HTTP server with no framework
-- **Phosphor Icons** for the icons in the log
+- Plain HTML, CSS and JavaScript (canvas) for the demo page, served by a small Rust HTTP server with no framework
 
 ## Run it
 
@@ -94,7 +100,7 @@ Turn it off and remove everything (container + image):
 docker rm -f concord && docker rmi concord-demo
 ```
 
-To put it on Railway, create a service from this repo. Railway builds the `Dockerfile` and sets `PORT` for you. Use `/healthz` as the health check path.
+To put it on Railway, create a service from this repo. Railway builds the `Dockerfile` and sets `PORT` for you. `railway.json` sets `/healthz` as the health check.
 
 ### Run a real cluster
 
@@ -132,7 +138,7 @@ I also broke the Raft code on purpose to make sure the tests would catch it. Com
 | `crates/raft` | Raft itself. No clock, network or disk inside it, so every run can be replayed exactly. |
 | `crates/storage` | The write-ahead log. It syncs to disk before returning, and on startup it cuts off a half-written last record. |
 | `crates/kv` | The key-value store. Put and Get only. |
-| `crates/sim` | The simulator, the chaos runs and the web demo. |
+| `crates/sim` | The simulator, the chaos runs, the intersection and the web demo. |
 | `crates/server` | gRPC server and client for a real cluster. |
 
 ## Limits
@@ -141,4 +147,5 @@ I also broke the Raft code on purpose to make sure the tests would catch it. Com
 - Crash testing covers the simulator's crash model (synced data survives, unsynced data is lost). It doesn't test real power loss or disks that lie about syncing.
 - Reads come from one server's copy, so they can be a little stale.
 - There's no PreVote, so a single flaky cable can cause repeated elections.
+- In the intersection, the leader learns which controllers are reachable from the simulated network. A real controller would notice that its messages go unanswered.
 - Not built yet: snapshots, log compaction, deletes, client sessions (a retried Put can be applied twice), TLS and auth. The log file grows forever.

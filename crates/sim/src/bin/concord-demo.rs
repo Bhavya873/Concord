@@ -1,73 +1,26 @@
-//! Browser demo over the deterministic simulator. Std only: no web framework.
+//! Browser demo: two traffic intersections, one with Raft and one without. Std only.
 //!
-//! Two clusters run side by side on the same seed and receive the same faults:
-//! Concord tells the client "confirmed" once a write is committed on a majority; the baseline
-//! tells it as soon as the leader has the write on its own disk. Raft runs identically in both.
+//! Every visitor gets a private intersection, keyed by a `sid` cookie (see
+//! `concord_sim::demo_session`). Sessions advance lazily on each request, so an idle tab costs
+//! nothing. The page draws the cars; the lights and controllers come from the simulator.
 //!
-//! Every visitor gets a private pair of clusters, keyed by a `sid` cookie (see
-//! `concord_sim::demo_session`). Sessions advance lazily on each request.
-//!
-//! `cargo run -p concord-sim --bin concord-demo` then open http://127.0.0.1:8766
+//! `cargo run -p concord-sim --bin concord-demo` then open http://127.0.0.1:8766. With `PORT`
+//! set (as on Railway) it listens on `0.0.0.0:$PORT`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use concord_sim::demo_session::{Session, Sessions, IDLE_TTL, MAX_SESSIONS};
-use concord_sim::{Cluster, PutError, TicketState};
+use concord_sim::demo_session::{Session, Sessions, IDLE_TTL, MAX_SESSIONS, TICK_MS};
+use concord_sim::intersection::Intersection;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{Rng, SeedableRng};
 
-const PAGE: &str = include_str!("../../web/index.html");
-
-const SCENE: &str = include_str!("../../web/scene.js");
-
-/// The page with the scene script's URL versioned by a hash of its contents, so a browser that
-/// cached an older `scene.js` fetches the new one after a deploy.
-fn page() -> &'static str {
-    static PAGE_VERSIONED: OnceLock<String> = OnceLock::new();
-    PAGE_VERSIONED.get_or_init(|| {
-        // FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
-        let hash = SCENE.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        });
-        PAGE.replace("__SCENE_VERSION__", &format!("{hash:016x}"))
-    })
-}
-
-/// Static files the page loads, embedded so the binary is self-contained. Anything not listed
-/// here is a 404; there is no file-system access.
-const ASSETS: &[(&str, &str, &str)] = &[
-    ("/scene.js", "text/javascript; charset=utf-8", SCENE),
-    (
-        "/vendor/three.module.min.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../../web/vendor/three.module.min.js"),
-    ),
-    (
-        "/vendor/OrbitControls.js",
-        "text/javascript; charset=utf-8",
-        include_str!("../../web/vendor/OrbitControls.js"),
-    ),
-    (
-        "/vendor/icons.svg",
-        "image/svg+xml",
-        include_str!("../../web/vendor/icons.svg"),
-    ),
-    (
-        "/vendor/LICENSE-phosphor.txt",
-        "text/plain; charset=utf-8",
-        include_str!("../../web/vendor/LICENSE-phosphor.txt"),
-    ),
-    (
-        "/vendor/LICENSE-three.txt",
-        "text/plain; charset=utf-8",
-        include_str!("../../web/vendor/LICENSE-three.txt"),
-    ),
-];
+/// The page, embedded so the binary is self-contained. It loads nothing but Google Fonts.
+const PAGE: &str = include_str!("../../web/intersection.html");
 
 /// Requests are small GETs and POSTs with query strings; anything bigger is refused.
 const MAX_REQUEST_BYTES: usize = 4096;
@@ -96,8 +49,6 @@ struct Reply {
     ctype: &'static str,
     body: String,
     sid: Option<String>,
-    /// Static assets may be cached for an hour; everything else is `no-store`.
-    cacheable: bool,
 }
 
 impl Reply {
@@ -107,7 +58,6 @@ impl Reply {
             ctype,
             body: body.into(),
             sid: None,
-            cacheable: false,
         }
     }
 
@@ -227,13 +177,8 @@ fn respond(stream: &mut TcpStream, reply: Reply) -> std::io::Result<()> {
             )
         })
         .unwrap_or_default();
-    let cache = if reply.cacheable {
-        "public, max-age=3600"
-    } else {
-        "no-store"
-    };
     let head = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\n\
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n{cookie}Connection: close\r\n\r\n",
         reply.status,
         reply.ctype,
@@ -244,86 +189,35 @@ fn respond(stream: &mut TcpStream, reply: Reply) -> std::io::Result<()> {
 }
 
 fn route(app: &App, req: &Request) -> Reply {
-    let q = req.query.as_str();
+    let id = || id_param(&req.query, "id");
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/healthz") => Reply::text("200 OK", "ok"),
+        // The session cookie comes with the page, so the first API call already has it.
         ("GET", "/") => {
-            // Hand out the session cookie with the page so the first API call already has it.
-            let mut r = Reply::new("200 OK", "text/html; charset=utf-8", page());
+            let mut r = Reply::new("200 OK", "text/html; charset=utf-8", PAGE);
             r.sid = with_session(app, req, |_| String::new()).sid;
             r
         }
-        ("GET", "/api/state") => with_session(app, req, |s| s.to_json()),
-        ("POST", "/api/put") => {
-            let (key, value) = (param(q, "key"), param(q, "value"));
-            each(app, req, |c| {
-                c.put(key.as_bytes(), value.as_bytes())
-                    .map(|_| ())
-                    .map_err(put_error)
-            })
-        }
-        ("POST", "/api/kill") => on_id(app, req, Cluster::kill),
-        ("POST", "/api/restart") => on_id(app, req, Cluster::restart),
-        ("POST", "/api/cut-link") => {
-            let (a, b) = (id_param(q, "a"), id_param(q, "b"));
-            each(app, req, |c| {
-                c.cut_link(a, b);
-                Ok(())
-            })
-        }
-        ("POST", "/api/restore-link") => {
-            let (a, b) = (id_param(q, "a"), id_param(q, "b"));
-            each(app, req, |c| {
-                c.restore_link(a, b);
-                Ok(())
-            })
-        }
-        ("POST", "/api/heal") => each(app, req, |c| {
-            c.heal();
-            Ok(())
+        ("GET", "/api/x/state") => with_session(app, req, state),
+        ("POST", "/api/x/cable") => with_session(app, req, |s| {
+            s.intersection.toggle_cable(id());
+            state(s)
         }),
-        ("POST", "/api/restart-all") => each(app, req, |c| {
-            for id in [1, 2, 3] {
-                c.restart(id);
-            }
-            Ok(())
+        ("POST", "/api/x/power") => with_session(app, req, |s| {
+            s.intersection.toggle_power(id());
+            state(s)
         }),
-        ("POST", "/api/scenario/queue-then-crash") => with_session(app, req, |s| {
-            let (key, value) = (param(q, "key"), param(q, "value"));
-            reply(&queue_then_crash(s, &key, &value), s)
+        ("POST", "/api/x/reset") => with_session(app, req, |s| {
+            s.intersection = Intersection::new(1);
+            state(s)
         }),
-        ("POST", "/api/scenario/cut-primary-and-queue") => {
-            let (key, value) = (param(q, "key"), param(q, "value"));
-            each(app, req, |c| {
-                let leader = c
-                    .serving_leader()
-                    .ok_or_else(|| put_error(PutError::NoLeader))?;
-                c.isolate(leader);
-                c.put_on(leader, key.as_bytes(), value.as_bytes())
-                    .map(|_| ())
-                    .map_err(put_error)
-            })
-        }
-        ("POST", "/api/reset") => {
-            let now = Instant::now();
-            with_session(app, req, |s| {
-                *s = Session::new(1, now);
-                reply("", s)
-            })
-        }
-        ("GET", path) if path.starts_with("/scene.js") || path.starts_with("/vendor/") => {
-            match ASSETS.iter().find(|(p, _, _)| *p == path) {
-                Some((_, ctype, body)) => {
-                    let mut r = Reply::new("200 OK", ctype, *body);
-                    r.cacheable = true;
-                    r
-                }
-                None => Reply::text("404 Not Found", "not found"),
-            }
-        }
         ("GET", _) | ("POST", _) => Reply::text("404 Not Found", "not found"),
         _ => Reply::text("405 Method Not Allowed", "method not allowed"),
     }
+}
+
+fn state(s: &mut Session) -> String {
+    s.intersection.to_json(TICK_MS)
 }
 
 /// Run `f` on the visitor's session after catching it up to now.
@@ -340,60 +234,6 @@ fn with_session(app: &App, req: &Request, f: impl FnOnce(&mut Session) -> String
         r.sid = Some(sid);
     }
     r
-}
-
-/// Apply `f` to both clusters. They see the same faults, so the first error stands for both.
-fn each(app: &App, req: &Request, mut f: impl FnMut(&mut Cluster) -> Result<(), String>) -> Reply {
-    with_session(app, req, |s| {
-        let concord = f(&mut s.concord);
-        let baseline = f(&mut s.baseline);
-        reply(&concord.and(baseline).err().unwrap_or_default(), s)
-    })
-}
-
-fn on_id(app: &App, req: &Request, f: impl Fn(&mut Cluster, u64)) -> Reply {
-    let id = id_param(&req.query, "id");
-    each(app, req, |c| {
-        f(c, id);
-        Ok(())
-    })
-}
-
-/// Queue a write on both clusters, run until the baseline leader has it on its own disk (the
-/// moment the baseline tells the client "confirmed"), then crash both leaders before their
-/// messages leave. Both clusters step together, so they stay in lockstep.
-fn queue_then_crash(s: &mut Session, key: &str, value: &str) -> String {
-    let base = s.baseline.put(key.as_bytes(), value.as_bytes());
-    let conc = s.concord.put(key.as_bytes(), value.as_bytes());
-    let (base, conc) = match (base, conc) {
-        (Ok(b), Ok(c)) => (b, c),
-        (Err(e), _) | (_, Err(e)) => return put_error(e),
-    };
-    for _ in 0..10 {
-        if s.baseline.ticket_state(&base) == TicketState::Acked {
-            break;
-        }
-        s.step();
-    }
-    s.baseline.crash_now(base.node);
-    s.concord.crash_now(conc.node);
-    String::new()
-}
-
-fn put_error(err: PutError) -> String {
-    match err {
-        PutError::NoLeader => {
-            "No main data center right now. The others are picking one; try again in a moment."
-                .to_string()
-        }
-        PutError::NodeDown => "That data center is turned off.".to_string(),
-        PutError::NotLeader { .. } => "That data center isn't the main one.".to_string(),
-    }
-}
-
-fn reply(error: &str, s: &Session) -> String {
-    let error = error.replace('\\', "\\\\").replace('"', "'");
-    format!("{{\"error\":\"{error}\",\"state\":{}}}", s.to_json())
 }
 
 fn id_param(query: &str, name: &str) -> u64 {

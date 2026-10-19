@@ -17,7 +17,7 @@
 
 mod chaos;
 pub mod demo_session;
-mod json;
+pub mod intersection;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,7 +107,6 @@ pub enum PutError {
 #[derive(Clone, Copy, Debug)]
 struct InFlight {
     deliver_at: u64,
-    sent_at: u64,
 }
 
 pub struct Cluster {
@@ -182,20 +181,12 @@ impl Cluster {
         }
     }
 
-    pub fn tick_count(&self) -> u64 {
-        self.tick
-    }
-
     pub fn violations(&self) -> &[String] {
         &self.violations
     }
 
     pub fn acked(&self) -> &[Ticket] {
         &self.acked
-    }
-
-    pub fn tickets(&self) -> &[(Ticket, TicketState)] {
-        &self.tickets
     }
 
     /// Writes the client was told were saved that can never come back.
@@ -294,6 +285,11 @@ impl Cluster {
 
     pub fn isolate(&mut self, id: NodeId) {
         self.isolated.insert(id);
+    }
+
+    /// Undo `isolate` for one node. Other isolations and cut links stay as they are.
+    pub fn rejoin(&mut self, id: NodeId) {
+        self.isolated.remove(&id);
     }
 
     /// Sever the single link between `a` and `b`. Their other links keep working. Raft sends
@@ -450,7 +446,6 @@ impl Cluster {
                 self.net.push((
                     InFlight {
                         deliver_at: tick + 1,
-                        sent_at: tick,
                     },
                     env,
                 ));
@@ -663,14 +658,6 @@ impl Cluster {
             .values()
             .filter_map(|m| m.raft.as_ref())
             .all(|r| r.leader() == Some(leader) && r.commit_index() == commit && commit > 0)
-    }
-
-    pub fn in_flight(&self) -> impl Iterator<Item = (&Envelope, u64)> {
-        self.net.iter().map(|(f, e)| (e, f.sent_at))
-    }
-
-    pub fn to_json(&self) -> String {
-        json::cluster(self)
     }
 }
 
